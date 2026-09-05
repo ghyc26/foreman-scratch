@@ -1,0 +1,132 @@
+# foreman fleet policy. Daemons watch this file and hot-reload it; a reload
+# affects future claims and future turns only — in-flight work drains under
+# the config it started with (stamped in its claim comment).
+repos:
+  ghyc26/bachlog:
+    defaults:
+      phase-models:
+        specs: { agent: claude, model: fable }
+        implementation: { agent: claude, model: sonnet }
+      reviewers:
+        strategy: alternate # fixed | alternate | random
+        # Cursor passed the docs/setup-macos.md §3a matrix on the macbook
+        # worker (2026-09-03); all three vendors review each other.
+        for-claude: [codex, cursor]
+        for-codex: [claude, cursor]
+        for-cursor: [claude, codex]
+      max-rounds: 5
+    # Timeline actors whose `status: ready` counts as authorization; add
+    # "github-project-automation[bot]" to arm tasks via board columns.
+    ready-appliers: [ghyc26]
+    # Headless-eligible skills: `always`, or `requires-headless-flag` (runs
+    # only when the task's metadata carries `headless: yes`).
+    auto-skills:
+      code-update: always
+      feature-implement: requires-headless-flag
+  # foreman dispatches work on its own repository: follow-up tasks from the
+  # Phase 1 exit test (#17-#19) and whatever comes after. Same routing and
+  # review policy as bachlog; code-update is the repository's one editing
+  # skill (.agents/skills/), documented headless-safe.
+  ghyc26/foreman:
+    defaults:
+      phase-models:
+        specs: { agent: claude, model: fable }
+        implementation: { agent: claude, model: sonnet }
+      reviewers:
+        strategy: alternate # fixed | alternate | random
+        for-claude: [codex, cursor]
+        for-codex: [claude, cursor]
+        for-cursor: [claude, codex]
+      max-rounds: 5
+    ready-appliers: [ghyc26]
+    auto-skills:
+      code-update: always
+  # Repositories on the self-hosted Gitea instance (docs/migrate-to-gitea.md).
+  # `forge` defaults to `github` when absent, so the entries above are
+  # unaffected. `api-base` is the instance's API root — there is no
+  # default host, unlike GitHub — and required whenever `forge: gitea`.
+  # Only one Gitea instance is supported per daemon today (repos on a
+  # second `api-base` fail config validation), and a repo's
+  # `forge`/`api-base` is read at daemon startup, not hot-reloaded: adding
+  # or moving a repo means a restart on every worker. Every daemon needs
+  # FOREMAN_GITEA_TOKEN in its environment while any repo uses this.
+  # Humans arm Gitea tasks as `ycastonguay`; the daemons act as the bot
+  # `foreman` (a Write collaborator on each repo, never a ready-applier).
+  # Same routing and review policy as the GitHub repos.
+  ycastonguay/rce2:
+    defaults: &gitea-defaults
+      phase-models:
+        specs: { agent: claude, model: fable }
+        implementation: { agent: claude, model: sonnet }
+      reviewers:
+        strategy: alternate # fixed | alternate | random
+        for-claude: [codex, cursor]
+        for-codex: [claude, cursor]
+        for-cursor: [claude, codex]
+      max-rounds: 5
+    ready-appliers: [ycastonguay]
+    # code-update is headless-safe; the feature and rewrite skills involve
+    # judgment calls, so each task opts in with `headless: yes`.
+    auto-skills:
+      code-update: always
+      feature-implement: requires-headless-flag
+      rewrite-game-system: requires-headless-flag
+      feature-create-specs: requires-headless-flag
+    forge: gitea
+    api-base: https://gitea.ycastonguay.com/api/v1
+  # Pre-code Swift project: its tasks write specs, and it has no
+  # code-update skill yet.
+  ycastonguay/earbie:
+    defaults: *gitea-defaults
+    ready-appliers: [ycastonguay]
+    auto-skills:
+      feature-create-specs: requires-headless-flag
+    forge: gitea
+    api-base: https://gitea.ycastonguay.com/api/v1
+  # Rehearsal entry for docs/migrate-to-gitea.md §6 (a disposable scratch
+  # repo); remove it right after the rehearsal pass reaches merge-ready.
+  ycastonguay/foreman-scratch:
+    defaults: *gitea-defaults
+    ready-appliers: [ycastonguay]
+    auto-skills:
+      code-update: always
+    forge: gitea
+    api-base: https://gitea.ycastonguay.com/api/v1
+workers:
+  linux-pc: { tags: [linux], cap: 4, coordinator: true }
+  macbook: { tags: [macos, swift], cap: 3 }
+# Live Claude turns (implement/fix/Claude-review), NOT claimed tasks — the
+# knob that protects interactive Max20 headroom. Counted from the `state:`
+# field of the fleet's claim comments, so every worker checks it pre-claim.
+claude-sessions-cap: 12
+# Every tick costs ~1 + 2×(open task issues) + 3×(tasks parked on a
+# human merge) GitHub requests, PER DAEMON, from the account's shared
+# 5,000/hour budget — fine-grained PATs of one user share that user's
+# budget, so every worker's ticks, its agent turns' own `gh` calls, and
+# the sweep all draw on it (more per parked PR aged out of the newest-100
+# PR window; see docs/setup-linux.md §6). With ~75 open task issues a
+# two-worker fleet at 5m spent ~3,500/hour on ticks alone and hit 403
+# backoff on 2026-09-04; 10m halves that. Never shorten it to watch a
+# drill (docs/setup-macos.md §6); follow the log instead. Conditional
+# requests (#67) are the durable fix. The interval is fleet-wide, so the
+# Gitea repos (no shared budget; 1m would be fine there) poll at the
+# GitHub pace until the last GitHub repo has moved.
+poll-interval: 10m
+# Automatic stale-sweep re-queues per task before needs-human; an explicit
+# `/foreman retry` does not count and resets it.
+max-sweep-requeues: 2
+# Forge logins whose foreman-* marker comments are the machine record;
+# anyone else's markers are ignored (a commenter must not be able to forge
+# claims, releases, or review rounds). Set this explicitly: when absent,
+# each worker resolves its own login via GET /user on the first tick, which
+# adds a token-scope dependency and a single point of failure for all
+# dispatch. A fleet with per-machine bot accounts must list every one.
+# GitHub markers are posted as `ghyc26`, Gitea markers as the bot
+# `foreman`; drop `ghyc26` only once no GitHub repo is listed above.
+marker-authors: [ghyc26, foreman]
+# Optional Mattermost pings from the coordinator's bot account. The bot
+# token comes from the MATTERMOST_TOKEN environment variable, never from
+# this file. Absent = no pings.
+# mattermost:
+#   url: https://mattermost.example.net
+#   channel-id: abcdef123456abcdef123456ab
